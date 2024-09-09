@@ -21,17 +21,18 @@ type VoteArgs struct {
 	Max         int
 	Editable    bool
 	Duplicate   bool
+	CreatorID   string
 }
 
 type Votes struct {
-	Votes      [][]VoteDetail
-	LastUpdate time.Time
-	IsEnded    bool
+	Votes      [][]VoteDetail `json:"votes"`
+	LastUpdate time.Time      `json:"lastupdate"`
+	IsEnded    bool           `json:"isended"`
 }
 
 type VoteDetail struct {
-	ID   string
-	Time time.Time
+	ID   string    `json:"id"`
+	Time time.Time `json:"time"`
 }
 
 var (
@@ -46,55 +47,55 @@ func VoteCommand() *botRouter.Command {
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        "title",
-				Description: "Vote title",
+				Description: "投票のタイトル",
 				Required:    true,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        "choices",
-				Description: "Comma-separated list of choices",
+				Description: "カンマ区切りの選択肢リスト",
 				Required:    true,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        "description",
-				Description: "Vote description",
+				Description: "投票の説明",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
 				Name:        "due",
-				Description: "Due date (RFC3339 format)",
+				Description: "締め切り日時 (RFC3339形式)",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionBoolean,
 				Name:        "anonymous",
-				Description: "Anonymous vote",
+				Description: "匿名投票",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionBoolean,
 				Name:        "mask",
-				Description: "Mask vote status",
+				Description: "投票状況を隠す",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionInteger,
 				Name:        "max",
-				Description: "Max votes per user",
+				Description: "ユーザーあたりの最大投票数",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionBoolean,
 				Name:        "editable",
-				Description: "Allow vote editing",
+				Description: "投票の編集を許可",
 				Required:    false,
 			},
 			{
 				Type:        discordgo.ApplicationCommandOptionBoolean,
 				Name:        "duplicate",
-				Description: "Allow duplicate votes",
+				Description: "重複投票を許可",
 				Required:    false,
 			},
 		},
@@ -103,29 +104,57 @@ func VoteCommand() *botRouter.Command {
 }
 
 func handleVote(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Interaction.ApplicationCommandData().Name != "vote" {
+		return
+	}
+	if i.Interaction.GuildID != i.GuildID {
+		return
+	}
 	options := i.ApplicationCommandData().Options
-	args := parseVoteArgs(options)
+	args, err := parseVoteArgs(options)
+	if err != nil {
+		respondWithError(s, i, err.Error())
+		return
+	}
 
 	embed := createVoteEmbed(args, i.Member.User)
 	components := createVoteComponents(args)
 
-	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Embeds:     &[]*discordgo.MessageEmbed{embed},
-		Components: &components,
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+		},
 	})
 
 	if err != nil {
-		fmt.Printf("Error sending vote message: %v", err)
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "An error occurred while creating the vote.",
-			},
-		})
+		fmt.Printf("Error sending vote message: %v\n", err)
+		return
 	}
+
+	message, err := s.InteractionResponse(i.Interaction)
+	if err != nil {
+		fmt.Printf("Error getting interaction response: %v\n", err)
+		return
+	}
+
+	args.CreatorID = i.Member.User.ID
+
+	votes := Votes{
+		Votes:      make([][]VoteDetail, len(args.Choices)),
+		LastUpdate: time.Now(),
+		IsEnded:    false,
+	}
+	voteStorage.Store(message.ID, &VoteData{Args: args, Votes: votes})
 }
 
-func parseVoteArgs(options []*discordgo.ApplicationCommandInteractionDataOption) VoteArgs {
+type VoteData struct {
+	Args  VoteArgs
+	Votes Votes
+}
+
+func parseVoteArgs(options []*discordgo.ApplicationCommandInteractionDataOption) (VoteArgs, error) {
 	args := VoteArgs{
 		Max:      1,
 		Editable: true,
@@ -140,7 +169,11 @@ func parseVoteArgs(options []*discordgo.ApplicationCommandInteractionDataOption)
 		case "choices":
 			args.Choices = strings.Split(opt.StringValue(), ",")
 		case "due":
-			args.Due, _ = time.Parse(time.RFC3339, opt.StringValue())
+			due, err := time.Parse(time.RFC3339, opt.StringValue())
+			if err != nil {
+				return args, fmt.Errorf("無効な締め切り日時形式です: %v", err)
+			}
+			args.Due = due
 		case "anonymous":
 			args.Anonymous = opt.BoolValue()
 		case "mask":
@@ -162,7 +195,15 @@ func parseVoteArgs(options []*discordgo.ApplicationCommandInteractionDataOption)
 		args.Editable = false
 	}
 
-	return args
+	if len(args.Choices) < 2 {
+		return args, fmt.Errorf("少なくとも2つの選択肢が必要です")
+	}
+
+	if len(args.Choices) > 20 {
+		return args, fmt.Errorf("選択肢が多すぎます (最大20)")
+	}
+
+	return args, nil
 }
 
 func createVoteEmbed(args VoteArgs, author *discordgo.User) *discordgo.MessageEmbed {
@@ -178,14 +219,14 @@ func createVoteEmbed(args VoteArgs, author *discordgo.User) *discordgo.MessageEm
 	return &discordgo.MessageEmbed{
 		Title:       args.Title,
 		Description: args.Description,
-		Color:       0xFFA500, // Orange
+		Color:       0x40639a, // Brand color
 		Fields:      fields,
 		Author: &discordgo.MessageEmbedAuthor{
 			Name:    author.Username,
 			IconURL: author.AvatarURL(""),
 		},
 		Footer: &discordgo.MessageEmbedFooter{
-			Text: time.Now().Format(time.RFC3339),
+			Text: fmt.Sprintf("締め切り: %s", args.Due.Format(time.RFC822)),
 		},
 	}
 }
@@ -213,7 +254,7 @@ func createVoteComponents(args VoteArgs) []discordgo.MessageComponent {
 	components = append(components, discordgo.ActionsRow{
 		Components: []discordgo.MessageComponent{
 			discordgo.Button{
-				Label:    "End/Restart",
+				Label:    "終了/再開",
 				Style:    discordgo.DangerButton,
 				CustomID: "toggle",
 			},
@@ -223,35 +264,39 @@ func createVoteComponents(args VoteArgs) []discordgo.MessageComponent {
 	return components
 }
 
-func handleVoteInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+func HandleVoteInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionMessageComponent {
+		return
+	}
+
 	data := i.MessageComponentData()
 	messageID := i.Message.ID
 
-	votesInterface, ok := voteStorage.Load(messageID)
+	voteDataInterface, ok := voteStorage.Load(messageID)
 	if !ok {
-		respondWithError(s, i, "Vote not found")
+		respondWithError(s, i, "投票が見つかりません")
 		return
 	}
-	votes := votesInterface.(Votes)
+	voteData := voteDataInterface.(*VoteData)
 
 	if data.CustomID == "toggle" {
-		if i.Member.User.ID != i.Message.Author.ID {
-			respondWithError(s, i, "Only the vote creator can end/restart the vote")
+		if i.Member.User.ID != voteData.Args.CreatorID {
+			respondWithError(s, i, "投票作成者のみが終了/再開できます")
 			return
 		}
-		votes.IsEnded = !votes.IsEnded
-		updateVoteMessage(s, i, votes)
+		voteData.Votes.IsEnded = !voteData.Votes.IsEnded
+		updateVoteMessage(s, i, voteData)
 		return
 	}
 
-	if votes.IsEnded {
-		respondWithError(s, i, "This vote has ended")
+	if voteData.Votes.IsEnded {
+		respondWithError(s, i, "この投票は終了しています")
 		return
 	}
 
 	choiceIndex, err := strconv.Atoi(strings.TrimPrefix(data.CustomID, "choice_"))
 	if err != nil {
-		respondWithError(s, i, "Invalid choice")
+		respondWithError(s, i, "無効な選択です")
 		return
 	}
 
@@ -261,60 +306,91 @@ func handleVoteInteraction(s *discordgo.Session, i *discordgo.InteractionCreate)
 		Time: time.Now(),
 	}
 
-	if err := validateVote(&votes, choiceIndex, userID); err != nil {
+	cancelled, err := validateVote(voteData, choiceIndex, userID)
+	if err != nil {
 		respondWithError(s, i, err.Error())
 		return
 	}
 
-	votes.Votes[choiceIndex] = append(votes.Votes[choiceIndex], voteDetail)
-	votes.LastUpdate = time.Now()
+	if !cancelled {
+		voteData.Votes.Votes[choiceIndex] = append(voteData.Votes.Votes[choiceIndex], voteDetail)
+	}
+	voteData.Votes.LastUpdate = time.Now()
 
-	voteStorage.Store(messageID, votes)
-	updateVoteMessage(s, i, votes)
+	voteStorage.Store(messageID, voteData)
+	updateVoteMessage(s, i, voteData)
 }
 
-func validateVote(votes *Votes, choiceIndex int, userID string) error {
-	if choiceIndex < 0 || choiceIndex >= len(votes.Votes) {
-		return fmt.Errorf("invalid choice")
+func validateVote(voteData *VoteData, choiceIndex int, userID string) (bool, error) {
+	if choiceIndex < 0 || choiceIndex >= len(voteData.Votes.Votes) {
+		return false, fmt.Errorf("無効な選択です")
 	}
 
-	voteCount := 0
-	for _, choiceVotes := range votes.Votes {
-		for _, vote := range choiceVotes {
+	// ユーザーがすでに投票しているかチェック
+	userVoteCount := 0
+	for i, choiceVotes := range voteData.Votes.Votes {
+		for j, vote := range choiceVotes {
 			if vote.ID == userID {
-				voteCount++
+				userVoteCount++
+				if i == choiceIndex {
+					// 同じ選択肢に対する投票をキャンセル
+					voteData.Votes.Votes[i] = append(voteData.Votes.Votes[i][:j], voteData.Votes.Votes[i][j+1:]...)
+					return true, nil // 投票がキャンセルされたことを示す
+				}
 			}
 		}
 	}
 
-	if voteCount >= 1 {
-		return fmt.Errorf("you have already voted")
+	// 最大投票数をチェック
+	if userVoteCount >= voteData.Args.Max {
+		return false, fmt.Errorf("投票数の上限に達しています")
 	}
 
-	return nil
+	// Duplicateが有効な場合、同じ選択肢への重複投票を防ぐ
+	if voteData.Args.Duplicate {
+		for _, vote := range voteData.Votes.Votes[choiceIndex] {
+			if vote.ID == userID {
+				return false, fmt.Errorf("この選択肢にはすでに投票しています")
+			}
+		}
+	} else {
+		// Duplicateが無効な場合、他の選択肢への投票を防ぐ
+		if userVoteCount > 0 {
+			return false, fmt.Errorf("すでに投票しています")
+		}
+	}
+
+	return false, nil
 }
 
-func updateVoteMessage(s *discordgo.Session, i *discordgo.InteractionCreate, votes Votes) {
+func updateVoteMessage(s *discordgo.Session, i *discordgo.InteractionCreate, voteData *VoteData) {
 	embed := i.Message.Embeds[0]
 	totalVotes := 0
 
-	for choiceIndex, choiceVotes := range votes.Votes {
+	for choiceIndex, choiceVotes := range voteData.Votes.Votes {
 		totalVotes += len(choiceVotes)
 		var value string
-		if votes.IsEnded {
+		if voteData.Votes.IsEnded || !voteData.Args.Mask {
 			percentage := 0
 			if totalVotes > 0 {
 				percentage = len(choiceVotes) * 100 / totalVotes
 			}
-			value = fmt.Sprintf("**%d vote(s), %d%%**", len(choiceVotes), percentage)
+			value = fmt.Sprintf("**%d票, %d%%**", len(choiceVotes), percentage)
+			if !voteData.Args.Anonymous {
+				voterList := make([]string, len(choiceVotes))
+				for i, vote := range choiceVotes {
+					voterList[i] = fmt.Sprintf("<@%s>", vote.ID)
+				}
+				value += "\n" + strings.Join(voterList, ", ")
+			}
 		} else {
-			value = fmt.Sprintf("**%d vote(s)**", len(choiceVotes))
+			value = "-"
 		}
 		embed.Fields[choiceIndex].Value = value
 	}
 
 	components := i.Message.Components
-	if votes.IsEnded {
+	if voteData.Votes.IsEnded {
 		for _, row := range components[:len(components)-1] {
 			for _, component := range row.(*discordgo.ActionsRow).Components {
 				button := component.(*discordgo.Button)
@@ -330,12 +406,15 @@ func updateVoteMessage(s *discordgo.Session, i *discordgo.InteractionCreate, vot
 		}
 	}
 
-	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Embeds:     &[]*discordgo.MessageEmbed{embed},
-		Components: &components,
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+		},
 	})
 	if err != nil {
-		fmt.Printf("Error updating vote message: %v", err)
+		fmt.Printf("投票メッセージの更新エラー: %v\n", err)
 	}
 }
 
@@ -343,7 +422,7 @@ func respondWithError(s *discordgo.Session, i *discordgo.InteractionCreate, erro
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("Error: %s", errorMessage),
+			Content: fmt.Sprintf("エラー: %s", errorMessage),
 			Flags:   discordgo.MessageFlagsEphemeral,
 		},
 	})
